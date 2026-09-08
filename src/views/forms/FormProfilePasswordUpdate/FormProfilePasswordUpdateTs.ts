@@ -15,10 +15,10 @@
  */
 import { Component, Vue } from 'vue-property-decorator';
 import { mapGetters } from 'vuex';
-import { Password, Crypto, Account } from 'symbol-sdk';
+import { Password, Account } from 'symbol-sdk';
 // internal dependencies
 import { ValidationRuleset } from '@/core/validation/ValidationRuleset';
-import { ProfileService } from '@/services/ProfileService';
+import { PasswordChangeService } from '@/services/PasswordChangeService';
 // child components
 import { ValidationObserver, ValidationProvider } from 'vee-validate';
 // @ts-ignore
@@ -31,7 +31,6 @@ import FormRow from '@/components/FormRow/FormRow.vue';
 import ModalFormProfileUnlock from '@/views/modals/ModalFormProfileUnlock/ModalFormProfileUnlock.vue';
 import { NotificationType } from '@/core/utils/NotificationType';
 import { ProfileModel } from '@/core/database/entities/ProfileModel';
-import { AccountService } from '@/services/AccountService';
 import { NetworkConfigurationModel } from '@/core/database/entities/NetworkConfigurationModel';
 @Component({
     components: {
@@ -132,24 +131,8 @@ export class FormProfilePasswordUpdateTs extends Vue {
      */
     public async onAccountUnlocked(account: Account, oldPassword: Password) {
         try {
-            const profileService = new ProfileService();
             const newPassword = new Password(this.formItems.password);
-            const oldSeed = this.currentProfile.seed;
-            const plainSeed = Crypto.decrypt(oldSeed, oldPassword.value);
-            const newSeed = oldSeed == '' ? oldSeed : Crypto.encrypt(plainSeed, newPassword.value);
-
-            // // - create new password hash
-            const passwordHash = ProfileService.getPasswordHash(newPassword);
-            profileService.updatePassword(this.currentProfile, passwordHash, this.formItems.passwordHint, newSeed);
-
-            const accountService = new AccountService();
-            const accountIdentifiers = this.currentProfile.accounts;
-
-            const accounts = accountService.getKnownAccounts(accountIdentifiers);
-            for (const model of accounts) {
-                const updatedModel = accountService.updateWalletPassword(model, oldPassword, newPassword);
-                accountService.saveAccount(updatedModel);
-            }
+            new PasswordChangeService().changePassword(this.currentProfile, oldPassword, newPassword, this.formItems.passwordHint);
 
             // - update state and finalize
             this.$store.dispatch('notification/ADD_SUCCESS', NotificationType.SUCCESS_PASSWORD_CHANGED);

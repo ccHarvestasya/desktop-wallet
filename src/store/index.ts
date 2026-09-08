@@ -35,6 +35,7 @@ import { onPeerConnection } from '@/store/plugins/onPeerConnection';
 import { AwaitLock } from '@/store/AwaitLock';
 import AddressBook from '@/store/AddressBook';
 import AggregateTransaction from '@/store/AggregateTransaction';
+import { PasswordChangeService } from '@/services/PasswordChangeService';
 import _ from 'lodash';
 import Vue from 'vue';
 import Vuex from 'vuex';
@@ -80,6 +81,7 @@ const getAppStore = (vueInstance?: typeof Vue) => {
             actions: {
                 async initialize({ dispatch, getters }) {
                     const callback = async () => {
+                        PasswordChangeService.recover();
                         await dispatch('app/initialize');
                         await dispatch('db/initialize');
                         await dispatch('diagnostic/initialize');
