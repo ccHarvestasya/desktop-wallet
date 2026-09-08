@@ -15,6 +15,7 @@ module.exports = {
         '^@/(.*)$': '<rootDir>/src/$1',
         '^@MOCKS/(.*)$': '<rootDir>/__mocks__/$1',
         '\\.(css|less)$': 'identity-obj-proxy',
+        '^js-sha3$': '<rootDir>/test/jest/js-sha3.js',
     },
     snapshotSerializers: ['jest-serializer-vue'],
     testMatch: ['**/__tests__/**/**/*.spec.ts'],

@@ -1,3 +1,5 @@
+/** @jest-environment node */
+
 /*
  * (C) Symbol Contributors 2021
  *
