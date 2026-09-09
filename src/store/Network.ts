@@ -264,7 +264,7 @@ export default {
         },
         async uninitialize({ dispatch, getters }) {
             const callback = async () => {
-                dispatch('UNSUBSCRIBE');
+                await dispatch('UNSUBSCRIBE');
                 dispatch('RESET_STATE');
             };
             await Lock.uninitialize(callback, { getters });

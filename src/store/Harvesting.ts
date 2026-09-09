@@ -158,13 +158,17 @@ export default {
         async FETCH_STATUS({ commit, rootGetters, dispatch }, node?: [string, NodeModel]) {
             const currentSignerAddress: Address = rootGetters['account/currentSignerAddress'];
             const currentSignerHarvestingModel: HarvestingModel = rootGetters['harvesting/currentSignerHarvestingModel'];
+            const repositoryFactory = rootGetters['network/repositoryFactory'];
+            const networkType: NetworkType = rootGetters['network/networkType'];
+            if (!currentSignerAddress || !repositoryFactory || !networkType) {
+                return;
+            }
             if (
                 currentSignerHarvestingModel?.accountAddress &&
                 currentSignerAddress.plain() !== currentSignerHarvestingModel.accountAddress
             ) {
                 return;
             }
-            const repositoryFactory = rootGetters['network/repositoryFactory'];
             const currentSignerAccountInfo = (
                 await repositoryFactory.createAccountRepository().getAccountsInfo([currentSignerAddress]).toPromise()
             )[0];
@@ -206,7 +210,6 @@ export default {
             //find the node url from currentSignerHarvestingModel (localStorage)
             const selectedNode = currentSignerHarvestingModel?.selectedHarvestingNode;
             const nodeService = new NodeService();
-            const networkType: NetworkType = rootGetters['network/networkType'];
             // try to find owned node with currentSignerAccountInfo.publicKey
             let nodeInfo = await nodeService.getNodeFromNodeWatchServiceByMainPublicKey(networkType, currentSignerAccountInfo.publicKey);
 

@@ -20,6 +20,11 @@ import i18n from '@/language/index';
 import { HarvestingService } from '@/services/HarvestingService';
 import { MultisigService } from '@/services/MultisigService';
 import { ProfileService } from '@/services/ProfileService';
+import { HarvestingModelStorage } from '@/core/database/storage/HarvestingModelStorage';
+import { MosaicModelStorage } from '@/core/database/storage/MosaicModelStorage';
+import { NetworkCurrenciesModelStorage } from '@/core/database/storage/NetworkCurrenciesModelStorage';
+import { NetworkModelStorage } from '@/core/database/storage/NetworkModelStorage';
+import { NodeModelStorage } from '@/core/database/storage/NodeModelStorage';
 import FormPersistentDelegationRequestTransaction from '@/views/forms/FormPersistentDelegationRequestTransaction/FormPersistentDelegationRequestTransaction.vue';
 import {
     account1,
@@ -35,7 +40,7 @@ import { getHandlers, responses } from '@MOCKS/Http';
 import { getTestProfile } from '@MOCKS/profiles';
 import TestUIHelpers from '@MOCKS/testUtils/TestUIHelpers';
 import userEvent from '@testing-library/user-event';
-import { screen, waitFor, within } from '@testing-library/vue';
+import { cleanup, screen, waitFor, within } from '@testing-library/vue';
 import flushPromises from 'flush-promises';
 import WS from 'jest-websocket-mock';
 import { setupServer } from 'msw/node';
@@ -59,11 +64,31 @@ const nodeResponse = {
     wsUrl: 'wss://example.com:3001/ws',
 };
 jest.spyOn(NodeWatchService.prototype, 'getNodes').mockReturnValue(Promise.resolve([nodeResponse]));
-jest.spyOn(NodeWatchService.prototype, 'getNodeByMainPublicKey').mockReturnValue(Promise.resolve(nodeResponse));
+const nodeWatchMainPublicKeySpy = jest
+    .spyOn(NodeWatchService.prototype, 'getNodeByMainPublicKey')
+    .mockReturnValue(Promise.resolve(nodeResponse));
 jest.spyOn(NodeWatchService.prototype, 'getNodeByNodePublicKey').mockReturnValue(Promise.resolve(nodeResponse));
 
 // mock http server with base responses denoted by * which are basic responses for the accounts __mock__/Accounts.ts
-const httpServer = setupServer(...getHandlers(responses['*']));
+const httpServer = setupServer(
+    ...getHandlers(responses['*']),
+    ...getHandlers([
+        {
+            origin: '*',
+            path: '/node/unlockedaccount',
+            method: 'get',
+            status: 200,
+            body: [],
+        },
+        {
+            origin: '*',
+            path: '/node/unlockedaccount',
+            method: 'options',
+            status: 200,
+            body: {},
+        },
+    ]),
+);
 // mock websocket server
 const websocketServer = new WS('wss://example.com:3001/ws', { jsonProtocol: true });
 websocketServer.on('connection', (socket) => {
@@ -71,11 +96,136 @@ websocketServer.on('connection', (socket) => {
     socket.send('{"uid":"FAKE_UID"}');
 });
 
-beforeAll(() => httpServer.listen());
+type StoreLike = {
+    dispatch: (action: string, payload?: unknown) => Promise<unknown>;
+    getters: Record<string, unknown>;
+    subscribeAction: (subscriber: {
+        before?: (action: { type: string }) => void;
+        after?: (action: { type: string }) => void;
+        error?: (action: { type: string }) => void;
+    }) => () => void;
+};
+
+type TrackedStore = {
+    store: StoreLike;
+    pendingActions: string[];
+};
+
+const storesToUninitialize = new Map<StoreLike, TrackedStore>();
+
+const trackStore = (store: StoreLike) => {
+    const existingStore = storesToUninitialize.get(store);
+    if (existingStore) {
+        return existingStore;
+    }
+
+    const trackedStore: TrackedStore = { store, pendingActions: [] };
+    store.subscribeAction({
+        before: ({ type }) => trackedStore.pendingActions.push(type),
+        after: ({ type }) => {
+            const actionIndex = trackedStore.pendingActions.indexOf(type);
+            if (actionIndex >= 0) {
+                trackedStore.pendingActions.splice(actionIndex, 1);
+            }
+        },
+        error: ({ type }) => {
+            const actionIndex = trackedStore.pendingActions.indexOf(type);
+            if (actionIndex >= 0) {
+                trackedStore.pendingActions.splice(actionIndex, 1);
+            }
+        },
+    });
+    storesToUninitialize.set(store, trackedStore);
+    return trackedStore;
+};
+
+const drainPendingActions = async (trackedStore: TrackedStore) => {
+    for (let attempt = 0; attempt < 40 && trackedStore.pendingActions.length > 0; attempt++) {
+        await flushPromises();
+        await CommonHelpers.sleep(25);
+    }
+    if (trackedStore.pendingActions.length > 0) {
+        throw new Error(`Store cleanup left pending Vuex actions: ${trackedStore.pendingActions.join(', ')}`);
+    }
+};
+
+const stopStoreSubscriptions = async (store: StoreLike) => {
+    const currentAccountAddress = store.getters['account/currentAccountAddress'];
+    if (currentAccountAddress) {
+        await store.dispatch('account/UNSUBSCRIBE', currentAccountAddress);
+    }
+    await store.dispatch('network/UNSUBSCRIBE');
+};
+
+beforeAll(() => httpServer.listen({ onUnhandledRequest: 'error' }));
 afterEach(async () => {
-    await flushPromises();
+    const cleanupErrors: unknown[] = [];
+
+    try {
+        await flushPromises();
+    } catch (error) {
+        cleanupErrors.push(error);
+    }
+
+    try {
+        cleanup();
+    } catch (error) {
+        cleanupErrors.push(error);
+    }
+
+    for (const trackedStore of storesToUninitialize.values()) {
+        try {
+            await stopStoreSubscriptions(trackedStore.store);
+        } catch (error) {
+            cleanupErrors.push(error);
+        }
+    }
+
+    for (const trackedStore of storesToUninitialize.values()) {
+        try {
+            await drainPendingActions(trackedStore);
+        } catch (error) {
+            cleanupErrors.push(error);
+        }
+    }
+
+    const generationHashes = new Set(
+        Array.from(storesToUninitialize.values())
+            .map(({ store }) => store.getters['network/generationHash'])
+            .filter((generationHash): generationHash is string => typeof generationHash === 'string'),
+    );
+    for (const generationHash of generationHashes) {
+        MosaicModelStorage.INSTANCE.remove(generationHash);
+        NetworkCurrenciesModelStorage.INSTANCE.remove(generationHash);
+        NetworkModelStorage.INSTANCE.remove(generationHash);
+    }
+
+    for (const trackedStore of storesToUninitialize.values()) {
+        try {
+            await trackedStore.store.dispatch('uninitialize');
+        } catch (error) {
+            cleanupErrors.push(error);
+        }
+    }
+    for (const trackedStore of storesToUninitialize.values()) {
+        try {
+            await drainPendingActions(trackedStore);
+        } catch (error) {
+            cleanupErrors.push(error);
+        }
+    }
+    storesToUninitialize.clear();
+    HarvestingModelStorage.INSTANCE.remove();
+    NodeModelStorage.INSTANCE.remove();
+    localStorage.removeItem('mosaicCache');
+    localStorage.removeItem('networkCurrencyCache');
+    localStorage.removeItem('harvestingModels');
     httpServer.resetHandlers();
     jest.clearAllMocks();
+
+    if (cleanupErrors.length > 0) {
+        throw cleanupErrors[0];
+    }
 });
 afterAll(() => {
     httpServer.close();
@@ -88,23 +238,27 @@ const sufficientAccountBalance = '10000000001';
 const sufficientAccountImportance = '1';
 
 describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
-    const renderPage = (currentAccount: AccountModel, knownAccounts: string[]) => {
-        return TestUIHelpers.renderComponentWithStore(
+    const renderPage = async (currentAccount: AccountModel, knownAccounts: string[]) => {
+        const rendered = await TestUIHelpers.renderComponentWithStore(
             FormPersistentDelegationRequestTransaction,
             currentAccount,
             knownAccounts,
             testProfileName,
         );
+        trackStore(rendered.store as StoreLike);
+        return rendered;
     };
 
-    const renderPageWithAccount = (currentAccount: AccountModel, knownAccounts: AccountModel[]) => {
-        return TestUIHelpers.renderComponentWithAccount(
+    const renderPageWithAccount = async (currentAccount: AccountModel, knownAccounts: AccountModel[]) => {
+        const store = await TestUIHelpers.renderComponentWithAccount(
             FormPersistentDelegationRequestTransaction,
             currentAccount,
             knownAccounts,
             testProfileName,
             sufficientAccountBalance,
         );
+        trackStore(store as StoreLike);
+        return store;
     };
 
     test('renders component', async () => {
@@ -139,12 +293,12 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             const input = screen.getByPlaceholderText(i18n.t('form_label_network_node_url').toString());
             await userEvent.type(input, 'https://001-joey-dual.symboltest.net:3001');
             const button = screen.getByRole('button', { name: i18n.t('start_harvesting').toString() });
-            userEvent.click(button);
+            await userEvent.click(button);
             const confirmButtonInModal = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-            userEvent.click(confirmButtonInModal);
+            await userEvent.click(confirmButtonInModal);
 
             // Assert:
-            TestUIHelpers.expectToastMessage(errorKey, 'error', 6000);
+            await TestUIHelpers.expectToastMessage(errorKey, 'error', 6000);
         };
 
         test('insufficient balance error is thrown', async () => {
@@ -186,12 +340,12 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             const input = await screen.findByPlaceholderText(i18n.t('form_label_network_node_url').toString());
             await userEvent.type(input, 'https://001-joey-dual.symboltest.net:3001');
             const button = await screen.findByRole('button', { name: 'Start Harvesting' });
-            userEvent.click(button);
+            await userEvent.click(button);
             const confirmButtonInModal = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-            userEvent.click(confirmButtonInModal);
+            await userEvent.click(confirmButtonInModal);
 
             // Assert:
-            TestUIHelpers.expectToastMessage('harvesting_account_has_zero_importance', 'error', 6000);
+            await TestUIHelpers.expectToastMessage('harvesting_account_has_zero_importance', 'error', 6000);
         });
 
         const testStartStopHarvestingWithAccount = async (
@@ -219,11 +373,11 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             await userEvent.type(input, 'https://example.com:3001');
             await TestUIHelpers.selectMaxFee(selectedMaxFee);
             const button = await screen.findByRole('button', { name: i18n.t('start_harvesting').toString() });
-            userEvent.click(button);
+            await userEvent.click(button);
             const confirmButtonInModal = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-            userEvent.click(confirmButtonInModal);
+            await userEvent.click(confirmButtonInModal);
             if (needToUnlockProfile) {
-                TestUIHelpers.unlockProfile(testProfilePassword);
+                await TestUIHelpers.unlockProfile(testProfilePassword);
             }
             await TestUIHelpers.confirmTransactions(testProfilePassword);
 
@@ -287,7 +441,7 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             );
 
             // Act:
-            userEvent.click(stopButton);
+            await userEvent.click(stopButton);
             await TestUIHelpers.confirmTransactions(testProfilePassword);
             // in order to trigger account/currentSignerAccountInfo update
             await store.dispatch('account/LOAD_ACCOUNT_INFO');
@@ -365,36 +519,22 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             const knownAccountModels = [WalletsModel1, WalletsModel2];
             const currentAccountModel = WalletsModel1;
 
-            // mock node details response for the node operator
-            httpServer.use(
-                ...getHandlers([
-                    {
-                        origin: '*',
-                        path: '/nodes/B98356E2B078F4E396E9316DAB8A1CDD2EF5CD6B66578F23F9A9BCF04D8C2A83',
-                        method: 'get',
-                        status: 200,
-                        body: {
-                            peerStatus: { isAvailable: true, lastStatusCheck: 1663685153698 },
-                            apiStatus: {
-                                restGatewayUrl: 'https://001-joey-dual.symboltest.net:3001',
-                                nodePublicKey: '05E5C0841720AE9DA737C184429002E917F74FF7A3BF8E11AC2862C4875B3D7E',
-                                nodeStatus: { apiNode: 'up', db: 'up' },
-                                restVersion: '2.4.0',
-                            },
-                            _id: '6329d2442f25ae00142e4ca3',
-                            version: 16777987,
-                            publicKey: 'B98356E2B078F4E396E9316DAB8A1CDD2EF5CD6B66578F23F9A9BCF04D8C2A83',
-                            networkGenerationHashSeed: '7FCCD304802016BEBBCD342A332F91FF1F3BB5E902988B352697BE245F48E836',
-                            networkIdentifier: 152,
-                            host: '001-joey-dual.symboltest.net',
-                            friendlyName: '001-joey-dual',
-                            lastAvailable: '2022-09-20T14:46:28.694Z',
-                            __v: 0,
-                        },
-                    },
-                ]),
-            );
-            await testStartStopHarvestingWithAccount(currentAccountModel, knownAccountModels, undefined, true);
+            const nodeOperatorResponse = {
+                ...nodeResponse,
+                endpoint: 'https://001-joey-dual.symboltest.net:3001',
+                friendlyName: '001-joey-dual',
+                mainPublicKey: currentAccountModel.publicKey,
+                nodePublicKey: '05E5C0841720AE9DA737C184429002E917F74FF7A3BF8E11AC2862C4875B3D7E',
+                wsUrl: 'wss://001-joey-dual.symboltest.net:3001/ws',
+            };
+            nodeWatchMainPublicKeySpy.mockImplementation(async (publicKey) => {
+                return publicKey === currentAccountModel.publicKey ? nodeOperatorResponse : nodeResponse;
+            });
+            try {
+                await testStartStopHarvestingWithAccount(currentAccountModel, knownAccountModels, undefined, false);
+            } finally {
+                nodeWatchMainPublicKeySpy.mockReturnValue(Promise.resolve(nodeResponse));
+            }
         });
 
         test('multisig account with 1 required cosignature - harvesting is successfully started and stopped', async () => {
@@ -436,11 +576,11 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
         const input = await screen.findByPlaceholderText(i18n.t('form_label_network_node_url').toString());
         await userEvent.type(input, 'https://example.com:3001');
         const keyLinksTab = await screen.findByText(i18n.t('tab_harvesting_key_links').toString());
-        userEvent.click(keyLinksTab);
+        await userEvent.click(keyLinksTab);
 
         expect(await screen.findByText(i18n.t('open_harvesting_keys_warning_title').toString())).toBeDefined();
         const confirmButton = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-        userEvent.click(confirmButton);
+        await userEvent.click(confirmButton);
         expect(await screen.findByText(i18n.t('delegated_harvesting_keys_info').toString())).toBeDefined();
         httpServer.use(
             ...getHandlers([
@@ -456,7 +596,7 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             ]),
         );
         const nodeLinkButton = await screen.findByTestId('btn_linkNodeKey');
-        userEvent.click(nodeLinkButton);
+        await userEvent.click(nodeLinkButton);
         await TestUIHelpers.confirmTransactions(testProfilePassword);
 
         // Assert:
@@ -475,15 +615,27 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
 
         // Test: unlink action
         // Arrange + Act:
+        httpServer.use(
+            ...getHandlers([
+                TestUIHelpers.getAccountsHttpResponse(
+                    currentSignerAccountModel ? currentSignerAccountModel : currentAccountModel,
+                    'post',
+                    () => ({}),
+                    () => sufficientAccountBalance,
+                    () => sufficientAccountImportance,
+                ),
+            ]),
+        );
         const nodeUnlinkButton = await screen.findByTestId('btn_unlinkNodeKey');
-        userEvent.click(nodeUnlinkButton);
+        await userEvent.click(nodeUnlinkButton);
         await TestUIHelpers.confirmTransactions(testProfilePassword);
 
         // in order to trigger account/currentSignerAccountInfo update
         await store.dispatch('account/LOAD_ACCOUNT_INFO');
+        await waitFor(() => expect(store.getters['harvesting/status']).toBe('INACTIVE'), { timeout: 3_000 });
 
         // Assert:
-        await waitFor(async () => expect(within(await screen.findByTestId('nodePublicKeyDisplay')).queryByText(nodePublicKey) === null), {
+        await waitFor(() => expect(screen.queryByTestId('nodePublicKeyDisplay')).toBeNull(), {
             timeout: 3_000,
         });
     };
@@ -510,11 +662,11 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
 
         // Act:
         const keyLinksTab = await screen.findByText(i18n.t('tab_harvesting_key_links').toString());
-        userEvent.click(keyLinksTab);
+        await userEvent.click(keyLinksTab);
 
         expect(await screen.findByText(i18n.t('open_harvesting_keys_warning_title').toString())).toBeDefined();
         let confirmButton = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-        userEvent.click(confirmButton);
+        await userEvent.click(confirmButton);
         expect(await screen.findByText(i18n.t('delegated_harvesting_keys_info').toString())).toBeDefined();
         httpServer.use(
             ...getHandlers([
@@ -533,17 +685,17 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             ]),
         );
         const nodeLinkButton = await screen.findByTestId('btn_linkAccountKey');
-        userEvent.click(nodeLinkButton);
-        userEvent.click(await screen.findByText('Select'));
+        await userEvent.click(nodeLinkButton);
+        await userEvent.click(await screen.findByText('Select'));
         if (privateKeyToBeImported) {
-            userEvent.click(await screen.findByText(i18n.t('import_key_manually').toString()));
+            await userEvent.click(await screen.findByText(i18n.t('import_key_manually').toString()));
             const privateKeyInput = await screen.findByTestId('privateKey');
             await userEvent.type(privateKeyInput, privateKeyToBeImported);
         } else {
-            userEvent.click(await screen.findByText(i18n.t('generate_random_public_key').toString()));
+            await userEvent.click(await screen.findByText(i18n.t('generate_random_public_key').toString()));
         }
         confirmButton = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-        userEvent.click(confirmButton);
+        await userEvent.click(confirmButton);
 
         if (isLedger) {
             await TestUIHelpers.unlockProfile(testProfilePassword);
@@ -578,18 +730,27 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
 
         // Test: unlink action
         // Arrange + Act:
+        httpServer.use(
+            ...getHandlers([
+                TestUIHelpers.getAccountsHttpResponse(
+                    currentSignerAccountModel ? currentSignerAccountModel : currentAccountModel,
+                    'post',
+                    () => ({}),
+                    () => sufficientAccountBalance,
+                    () => sufficientAccountImportance,
+                ),
+            ]),
+        );
         const nodeUnlinkButton = await screen.findByTestId('btn_unlinkAccountKey');
-        userEvent.click(nodeUnlinkButton);
+        await userEvent.click(nodeUnlinkButton);
         await TestUIHelpers.confirmTransactions(testProfilePassword);
 
         // in order to trigger account/currentSignerAccountInfo update
         await store.dispatch('account/LOAD_ACCOUNT_INFO');
+        await waitFor(() => expect(store.getters['harvesting/status']).toBe('INACTIVE'), { timeout: 3_000 });
 
         // Assert:
-        await waitFor(
-            async () => expect(within(await screen.findByTestId('accountPublicKeyDisplay')).queryByText(remoteAccountPublicKey) === null),
-            { timeout: 3_000 },
-        );
+        await waitFor(() => expect(screen.queryByTestId('accountPublicKeyDisplay')).toBeNull(), { timeout: 3_000 });
     };
 
     const testLinkUnlinkVrfPublicKey = async (
@@ -612,11 +773,11 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
 
         // Act:
         const keyLinksTab = await screen.findByText(i18n.t('tab_harvesting_key_links').toString());
-        userEvent.click(keyLinksTab);
+        await userEvent.click(keyLinksTab);
 
         expect(await screen.findByText(i18n.t('open_harvesting_keys_warning_title').toString())).toBeDefined();
         let confirmButton = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-        userEvent.click(confirmButton);
+        await userEvent.click(confirmButton);
         expect(await screen.findByText(i18n.t('delegated_harvesting_keys_info').toString())).toBeDefined();
         httpServer.use(
             ...getHandlers([
@@ -635,11 +796,11 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
             ]),
         );
         const nodeLinkButton = await screen.findByTestId('btn_linkVrfKey');
-        userEvent.click(nodeLinkButton);
-        userEvent.click(await screen.findByText('Select'));
-        userEvent.click(await screen.findByText(i18n.t('generate_random_public_key').toString()));
+        await userEvent.click(nodeLinkButton);
+        await userEvent.click(await screen.findByText('Select'));
+        await userEvent.click(await screen.findByText(i18n.t('generate_random_public_key').toString()));
         confirmButton = await screen.findByRole('button', { name: i18n.t('confirm').toString() });
-        userEvent.click(confirmButton);
+        await userEvent.click(confirmButton);
 
         await TestUIHelpers.confirmTransactions(testProfilePassword);
 
@@ -662,15 +823,27 @@ describe('views/forms/FormPersistentDelegationRequestTransaction', () => {
 
         // Test: unlink action
         // Arrange + Act:
+        httpServer.use(
+            ...getHandlers([
+                TestUIHelpers.getAccountsHttpResponse(
+                    currentSignerAccountModel ? currentSignerAccountModel : currentAccountModel,
+                    'post',
+                    () => ({}),
+                    () => sufficientAccountBalance,
+                    () => sufficientAccountImportance,
+                ),
+            ]),
+        );
         const nodeUnlinkButton = await screen.findByTestId('btn_unlinkVrfKey');
-        userEvent.click(nodeUnlinkButton);
+        await userEvent.click(nodeUnlinkButton);
         await TestUIHelpers.confirmTransactions(testProfilePassword);
 
         // in order to trigger account/currentSignerAccountInfo update
         await store.dispatch('account/LOAD_ACCOUNT_INFO');
+        await waitFor(() => expect(store.getters['harvesting/status']).toBe('INACTIVE'), { timeout: 3_000 });
 
         // Assert:
-        await waitFor(async () => expect(within(await screen.findByTestId('vrfPublicKeyDisplay')).queryByText(vrfPublicKey) === null), {
+        await waitFor(() => expect(screen.queryByTestId('vrfPublicKeyDisplay')).toBeNull(), {
             timeout: 3_000,
         });
     };

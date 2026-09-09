@@ -133,11 +133,17 @@ export default {
         currentSignerPublicKey: (state: AccountState) => state.currentSignerPublicKey,
         knownAccounts: (state: AccountState) => state.knownAccounts,
         accountsInfo: (state: AccountState) => state.accountsInfo,
-        currentAccountAccountInfo: (state: AccountState): AccountInfo => {
-            return state.accountsInfo.find(({ publicKey }) => publicKey === state.currentAccount.publicKey);
+        currentAccountAccountInfo: (state: AccountState): AccountInfo | null => {
+            if (!state.currentAccount) {
+                return null;
+            }
+            return state.accountsInfo.find(({ publicKey }) => publicKey === state.currentAccount.publicKey) || null;
         },
-        currentSignerAccountInfo: (state: AccountState): AccountInfo => {
-            return state.accountsInfo.find(({ address }) => address.plain() === state.currentSigner.address.plain());
+        currentSignerAccountInfo: (state: AccountState): AccountInfo | null => {
+            if (!state.currentSigner) {
+                return null;
+            }
+            return state.accountsInfo.find(({ address }) => address.plain() === state.currentSigner.address.plain()) || null;
         },
         multisigAccountsInfo: (state: AccountState) => state.multisigAccountsInfo,
         getSubscriptions: (state: AccountState) => state.subscriptions,
@@ -308,7 +314,7 @@ export default {
                 commit('knownAddresses', []);
                 commit('accountsInfo', []);
                 commit('multisigAccountsInfo', []);
-                commit('subscriptions', {});
+                commit('setSubscriptions', {});
                 commit('currentRecipient', null);
                 commit('multisigAccountGraph', null);
                 commit('multisigAccountGraphInfo', null);
@@ -725,12 +731,20 @@ export default {
 
         // Unsubscribe an address open websocket connections
         async UNSUBSCRIBE({ commit, getters }, plainAddress: Address) {
+            if (!plainAddress) {
+                return;
+            }
+
             // get all subscriptions
             const subscriptions: Record<string, SubscriptionType[]> = getters.getSubscriptions;
             // subscriptions to close
             const subscriptionTypes = (subscriptions && subscriptions[plainAddress.plain()]) || [];
 
             if (!subscriptionTypes.length) {
+                const listener = getters['listener'];
+                if (listener && listener.isOpen()) {
+                    await listener.close();
+                }
                 return;
             }
 

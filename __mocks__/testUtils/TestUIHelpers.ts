@@ -57,9 +57,9 @@ export default class TestUIHelpers {
 
     public static async unlockProfile(profilePassword: string) {
         const passwordInput = await screen.findByTestId('unlockProfilePasswordInput');
-        userEvent.type(passwordInput, profilePassword);
+        await userEvent.type(passwordInput, profilePassword);
         const confirmButton = await screen.findByTestId('unlockProfileConfirmButton');
-        userEvent.click(confirmButton);
+        await userEvent.click(confirmButton);
         return;
     }
 
@@ -76,7 +76,7 @@ export default class TestUIHelpers {
 
     public static async selectMaxFee(maxFeeKeyToBeSelected: string, currentSelectedMaxFeeKey = 'slow') {
         // open the dropdown
-        userEvent.click(
+        await userEvent.click(
             (
                 await within(await screen.findByTestId('maxFeeSelector')).findAllByText(
                     i18n.t(`fee_speed_${currentSelectedMaxFeeKey}`).toString(),
@@ -85,7 +85,7 @@ export default class TestUIHelpers {
             )[0],
         );
         // select the target max fee from dropdown
-        userEvent.click(
+        await userEvent.click(
             (
                 await within(await screen.findByTestId('maxFeeSelector')).findAllByText(
                     i18n.t(`fee_speed_${maxFeeKeyToBeSelected}`).toString(),
@@ -184,8 +184,8 @@ export default class TestUIHelpers {
         store: Store<any>,
         expectedAccountBalance?: string,
     ) {
-        userEvent.click((await within(await screen.findByTestId('signerSelector')).findAllByText(currentAccountAddress))[0]);
-        userEvent.click(
+        await userEvent.click((await within(await screen.findByTestId('signerSelector')).findAllByText(currentAccountAddress))[0]);
+        await userEvent.click(
             (await within(await screen.findByTestId('signerSelector')).findAllByText(currentSignerAddress, { exact: false }))[0],
         );
         await waitFor(() => expect(store.getters['account/currentSignerAccountInfo'].address.plain()).toBe(currentSignerAddress));
